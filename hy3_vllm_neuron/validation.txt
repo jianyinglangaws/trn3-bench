@@ -1,0 +1,8 @@
+# Validation of the patched tree (vllm-neuron e891054 + patches/0001-0003), fresh compile, 2026-11-17
+# scripts/serve_85k_trn3.sh (GANG_WAIT 4.5) + scripts/bench_85k_slo.sh <dir> <C> '' 1024
+c=20 200/200 TTFT p50/p90 5.27/6.90 s TPOT p50/p90 18.80/21.90 ms ITL p50 30.7 hit 92.1% out 807 tok/s MTP 2.15 tok/step  SLO PASS
+c=20 200/200 TTFT p50/p90 5.01/6.42 s TPOT p50/p90 19.28/21.39 ms ITL p50 30.6 hit 92.1% out 802 tok/s MTP 2.16 tok/step  SLO PASS
+c=24 240/240 TTFT p50/p90 5.25/8.24 s TPOT p50/p90 21.36/24.79 ms ITL p50 31.9 hit 92.1% out 888 tok/s MTP 2.15 tok/step  SLO fail
+c=24 240/240 TTFT p50/p90 5.63/8.35 s TPOT p50/p90 20.06/23.66 ms ITL p50 31.9 hit 92.1% out 898 tok/s MTP 2.16 tok/step  SLO fail
+=== MATH-500 reasoning_effort=no_think temp=0.9: accuracy 97.0% (485/500); avg completion tokens 621, truncated 5, wall 582s
+needle: 12/12 passed

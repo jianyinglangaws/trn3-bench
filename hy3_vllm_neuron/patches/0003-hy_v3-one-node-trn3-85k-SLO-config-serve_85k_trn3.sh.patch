@@ -1,0 +1,497 @@
+From f8974bc4b2bbe95b98e6b7b2b42189a53b4286c4 Mon Sep 17 00:00:00 2001
+From: Jianying Lang <langjian@amazon.com>
+Date: Tue, 17 Nov 2026 22:20:33 +0000
+Subject: [PATCH 3/3] hy_v3: one-node trn3 85k SLO config (serve_85k_trn3.sh),
+ SLO bench, trn3 KV profile, docs
+
+serve_85k_trn3.sh: prefill + decode on one trn3 node, FP8 KV (448-range profile), MTP k=3, sparse 0.0625,
+max_model_len 87040, 24 requests. bench_85k_slo.sh: closed-loop 85k shared-prefix bench, SLO TTFT P50 < 7 s,
+TPOT P50 < 20 ms, prefix hit > 92%. C = 20: 802-807 output tok/s, SLO met; MATH-500 97.0%, needle 12/12.
+kv_profiles/Hy3-FP8_mtp_neuron_trn3.safetensors via scripts/reexport_kv_profile.py. docs/TRN3_85K_SLO.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ contrib/models/hy_v3/README.md                |   9 ++
+ contrib/models/hy_v3/docs/TRN3_85K_SLO.md     |  91 ++++++++++++++++++
+ .../Hy3-FP8_mtp_neuron_trn3.safetensors       | Bin 0 -> 20344 bytes
+ contrib/models/hy_v3/kv_profiles/README.md    |   3 +
+ contrib/models/hy_v3/scripts/bench_85k_slo.sh |  54 +++++++++++
+ .../hy_v3/scripts/profile_85k_client.py       |  20 ++++
+ .../hy_v3/scripts/reexport_kv_profile.py      |  28 ++++++
+ contrib/models/hy_v3/scripts/serve.sh         |  10 +-
+ .../models/hy_v3/scripts/serve_85k_trn3.sh    |  41 ++++++++
+ contrib/models/hy_v3/scripts/serve_latency.sh |   2 +-
+ 10 files changed, 254 insertions(+), 4 deletions(-)
+ create mode 100644 contrib/models/hy_v3/docs/TRN3_85K_SLO.md
+ create mode 100644 contrib/models/hy_v3/kv_profiles/Hy3-FP8_mtp_neuron_trn3.safetensors
+ create mode 100755 contrib/models/hy_v3/scripts/bench_85k_slo.sh
+ create mode 100644 contrib/models/hy_v3/scripts/reexport_kv_profile.py
+ create mode 100755 contrib/models/hy_v3/scripts/serve_85k_trn3.sh
+
+diff --git a/contrib/models/hy_v3/README.md b/contrib/models/hy_v3/README.md
+index 5c7aa68..efa0c09 100644
+--- a/contrib/models/hy_v3/README.md
++++ b/contrib/models/hy_v3/README.md
+@@ -871,6 +871,15 @@ Notes:
+   - It needs the matching `NeuronMooncakeConnector` change on top of vllm-project/vllm-neuron#90, which is not part of this branch.
+   - At C = 4 that pair gave 485 requests, TTFT P50 / P90 / P99 1.34 / 4.0 / 16.0 s and ITL P50 / P99 21 / 25 ms.
+ 
++## One trn3 node: 85k shared prefix under a latency SLO
++
++`scripts/serve_85k_trn3.sh` serves prefill and decode on one trn3 node (TP=64, FP8 KV with the 448-range profile
++`kv_profiles/Hy3-FP8_mtp_neuron_trn3.safetensors`, MTP k=3, sparse attention 0.0625, max_model_len 87040,
++up to 24 requests). `scripts/bench_85k_slo.sh` runs the closed loop: 85,000-token prompts with a 78,336-token shared
++prefix, 1024 output tokens, SLO TTFT P50 < 7 s, TPOT P50 < 20 ms, prefix-cache hit > 92%.
++C = 20 gives about 790 output tok/s with every SLO met. MATH-500 is 97.2% and needle 12/12. Flags, results, the decode
++profile and the switches that were measured and left off are in [docs/TRN3_85K_SLO.md](docs/TRN3_85K_SLO.md).
++
+ ## Compatibility Matrix
+ 
+ | Instance / Neuron SDK version | 2.33.0      | 2.32 and earlier |
+diff --git a/contrib/models/hy_v3/docs/TRN3_85K_SLO.md b/contrib/models/hy_v3/docs/TRN3_85K_SLO.md
+new file mode 100644
+index 0000000..459c4f8
+--- /dev/null
++++ b/contrib/models/hy_v3/docs/TRN3_85K_SLO.md
+@@ -0,0 +1,91 @@
++# Hy3-FP8 on one trn3 node: 85k shared-prefix workload under a latency SLO
++
++`scripts/serve_85k_trn3.sh` serves Hy3-FP8 on one trn3 node (TP=64, EP=64, LNC=2), with prefill and decode on the
++same server. `scripts/bench_85k_slo.sh` measures it.
++
++## Workload and SLO
++
++- Every request is the 78,336-token shared prefix of `bench_data/prefix` plus its own suffix: 85,000 input tokens and
++  1024 output tokens (`ignore_eos`), sampled at temperature 0.9.
++- The benchmark runs a closed loop at concurrency C, with 10 x C requests per point.
++- SLO: TTFT P50 < 7 s, TPOT P50 < 20 ms, and a prefix-cache hit rate above 92% (from the server's `/metrics`).
++  P90 values are reported as well.
++- The metric is output tok/s at the highest C at which the SLO holds.
++
++## Configuration
++
++FP8 KV with the 448-range trn3 profile (`kv_profiles/Hy3-FP8_mtp_neuron_trn3.safetensors`), MTP k=3, sparse
++prefill and sparse decode attention at 0.0625, max_model_len 87040 and max_num_seqs 24. The prefill buckets go up to
++8192, so the ~6.7k-token suffix of a request is one prefill chunk. The decode buckets are [1, 8, 16, 20, 24].
++
++| Area | Flags | What they do |
++|---|---|---|
++| Prefill experts | `HY3_MOE_CTE_MX` `HY3_MOE_CTE_NO_REDUCE` `HY3_MOE_CTE_SKIP_WEIGHT` `HY3_MX_DMA_SPLIT=2` | Run the routed experts in STATIC_MX (trn3 native FP8 MX matmul), add the two shard partials in the graph, and skip reloading the weights when consecutive blocks use the same expert |
++| Prefill MoE glue | `HY3_PREFILL_AG_TOPK` `HY3_MOE_ROWPAD` `HY3_MOE_PIPE` | All-gather only the top-k pairs. Pad the routing rows to a multiple of 2048, so the blockwise mapping takes the NKI path at every bucket (7168 included) |
++| Prefill attention | `HY3_PREFILL_ATTN_BLOCK=64` `HY3_PREFIX_ALIGN=64` `KV_SEGMENTS=[8192]` | View the contiguous BF16 request copy as 64-token blocks: the segmented kernel issues 2x fewer block DMAs (bit-identical). The prefix-cache hit is aligned to 64 tokens |
++| Prefill K/V write | `HY3_PREFILL_ROW_SCATTER` `HY3_PREFILL_BLOCK_SCATTER` `HY3_ROPE_TABLE` | Write the K/V cache in whole blocks; RoPE from a table |
++| Sparse prefill / decode | `HY3_SPARSE_PREFILL=0.0625` `HY3_SPARSE_DECODE=0.0625` `HY3_SPARSE_SELECT_EVERY=16` `HY3_SPARSE_*_PREP` `HY3_SPARSE_FLAT_GATHER` | Block selection from per-group K summaries (see `SPARSE_DECODE.md`). Layer-invariant preparation runs once per step, and the selection gathers run as flat `index_select` |
++| Decode attention | `HY3_DECODE_KVDP_FORK=8` `HY3_DECODE_KVDP_MIN_B=2` `HY3_SPARSE_KVDP` `HY3_SPARSE_KFROM_KERNEL` `HY3_SPARSE_KSUM_KERNEL` `HY3_SPARSE_KSUM_SELECT_ONLY` | KV data parallelism with the forked `attention_block_tkg_kvdp`: each of the 8 ranks sharing a KV head attends B/8 requests and writes all B new tokens. The sparse selection runs inside it. K comes back from the kernel, and an NKI kernel (`kernels/ksum_update.py`) updates the K summaries |
++| Decode MoE | `HY3_DECODE_MOE_FUSED` `HY3_DECODE_MOE_MX` `HY3_DECODE_HITS=0` | Fused decode MoE (PR #8, trn3 port with OCP FP8 activations) |
++| Host / launch | `HY3_IO_STABLE=2` `HY3_IO_STABLE_MAXB=0` `HY3_IO_STABLE_H2D=3` `HY3_DECODE_STEP_CONST` | Pooled per-graph output buffers and round-robin H2D input buffers (the runtime IO-ring cache then hits); constant per-step tensors |
++| Scheduler | `HY3_PREFILL_GANG=1` `HY3_GANG_MAX_WAIT_S` (4.5) `HY3_GANG_TAIL` `HY3_GANG_GATHER_S` `HY3_GANG_NO_TAIL` | Gang prefill (`vllm_neuron/vllm/core/scheduler.py`): hold arriving prefills briefly and run them back to back, so the running decodes stall fewer times per request |
++| Admission | `VLLM_NEURON_MAX_KV_CONCURRENT=24`, `NUM_BLOCKS=16000` | The worst-case cap (no prefix sharing) would admit 5 requests. The shared prefix is stored once, so 24 fit |
++
++`HY3_DECODE_KVDP_FORK` is a different implementation from `HY3_DECODE_KVDP` (`kvdp_attention.py`, the dense PD
++decode switch, which is unchanged). The fork runs the sparse selection inside KVDP; on trn3 with sparse decode it is
++the faster of the two. Set at most one of them.
++
++The other `HY3_*` flags in `model.py` are experiments that are off by default (see "Measured and not used" below).
++
++## Results (trn3, vllm-neuron 0.29.0.1.2.0 image, neuronx-cc 2.28, 2026-11-17)
++
++| C | GANG_WAIT | runs | output tok/s | TPOT P50 (ms) | TTFT P50 (s) | SLO |
++|---|---|---|---|---|---|---|
++| 20 | 4.5 | 2 | 793-795 | 19.3-19.8 | 4.98 | pass in 2 of 2 |
++| 20 | 5.5 | 71 | 758-834, mean 776 | 17.8-19.7 | 5.57-6.65 | pass in 71 of 71 |
++| 24 | 4.5 | 4 | 879-907 | 20.6-21.4 | 5.0-5.25 | fail in 4 of 4 (TPOT) |
++| 24 | 5.5 | 13 | 855-892 | 19.5-20.5 | 6.0-6.96 | pass in 7 of 13 |
++
++- On the rebased branch (upstream e891054 merged, `serve_85k_trn3.sh`, gang wait 4.5), fresh compile:
++  - C = 20: 807 tok/s / TPOT 18.80 ms / TTFT 5.27 s, and 802 / 19.28 / 5.01, both pass.
++  - C = 24: 888 / 21.36 / 5.25 and 898 / 20.06 / 5.63, both fail on TPOT.
++  - MATH-500 97.0% (485/500), needle 12/12.
++  - The table above was measured on the same code before the rebase.
++- Prefix-cache hit rate is 92.1% and MTP acceptance 2.13-2.17 tokens per step in every run.
++- The best point that passes reliably is C = 20 at about 790 output tok/s per node. C = 24 gives about 880 tok/s with
++  TPOT right at the limit.
++- Accuracy with this configuration: MATH-500 no_think (temperature 0.9) 97.2% (486/500); needle (85k, 12 depths) 12/12.
++
++Decode profile at batch 24 (one target step = 28.1 ms + 3.7 ms for the MTP draft):
++- attention 10.5 ms, routed experts 11.8 ms, collectives 4.2 ms on TP0;
++- on pcore 1, 161 BF16 all-reduces of 786 KB take 3.95 ms and 160 all-to-alls take 1.4 ms;
++- torch ops of the sparse selection take 1.3 ms.
++
++At C = 24, TPOT P50 is about 14.8 ms of decode plus about 6-7 ms of prefill stalls per token.
++
++For reference, the trn2 PD results in this README are 1P1D chat end to end at C = 8 (TPOT 19.38 ms, about 192 output
++tok/s per node) and D-only at C = 10 (446 tok/s on the decode node).
++
++## Measured and not used
++
++Each of these was measured on trn3 and left off:
++- `HY3_DECODE_EXPERT_TP`, STATIC_MX decode experts with a balanced core split (`moe_tkg_mx_balanced*`)
++- the NKI router (`HY3_ROUTER_NKI`)
++- LNC-rebalanced prefill attention (`HY3_PREFILL_ATTN_BALANCE`, `HY3_PREFILL_ATTN_SPLIT`)
++- decode early exit (`HY3_DECODE_EARLY_EXIT`; inert below 32K buckets)
++- context-split decode (`HY3_DECODE_CTXSPLIT`)
++- the FP8 attention all-gather (`HY3_PREFILL_AG_FP8`)
++- the fused prefill QKV (`HY3_PREFILL_FUSED_QKV`; it conflicts with the coarse-block view)
++- the prefill MoE micro-batch split (`HY3_PREFILL_MOE_SPLIT=2`; its collectives do not overlap)
++- the fused shared expert (`HY3_DECODE_FUSED_SHARED`)
++- a greedy MTP draft
++- `sampling_dp_degree` 8 (the drafter recompiles under `fail_on_recompile`)
++- `NEURON_RT_CC_ALG_TYPES=^INTRA_RDH_ALG` (no ITL change on trn3)
++- the on-chip decode mask (`HY3_DECODE_POSID`; the mask load is overlapped)
++
++## Reproduce
++
++```bash
++bash scripts/serve_85k_trn3.sh                      # fresh compile ~50 min; GANG_WAIT=5.5 for C = 24
++bash scripts/bench_85k_slo.sh results/trn3_85k "20 24"
++```
+diff --git a/contrib/models/hy_v3/kv_profiles/Hy3-FP8_mtp_neuron_trn3.safetensors b/contrib/models/hy_v3/kv_profiles/Hy3-FP8_mtp_neuron_trn3.safetensors
+new file mode 100644
+index 0000000000000000000000000000000000000000..5486712cea0edfa7ed1ef3376ce47acb702189cb
+GIT binary patch
+literal 20344
+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
+MgWm!^{Il-(JJ{wW2mk;8
+
+literal 0
+HcmV?d00001
+
+diff --git a/contrib/models/hy_v3/kv_profiles/README.md b/contrib/models/hy_v3/kv_profiles/README.md
+index da434e8..2693270 100644
+--- a/contrib/models/hy_v3/kv_profiles/README.md
++++ b/contrib/models/hy_v3/kv_profiles/README.md
+@@ -5,6 +5,7 @@ FP8 KV cache scales for Hy3 (`--kv-cache-dtype fp8`, format and loader in
+ 
+ | File | Checkpoint | Calibration |
+ |---|---|---|
++| `Hy3-FP8_mtp_neuron_trn3.safetensors` (sha256 `31eea76457618664...`) | tencent/Hy3-FP8, 81 layers (as `Hy3-FP8_mtp_neuron`) | trn3 (OCP `float8_e4m3fn`, range 448): `scripts/reexport_kv_profile.py Hy3-FP8_mtp_neuron.safetensors <dst> 448` from the stored per-layer absmax, DEQUANT scale `absmax / 448` (same clipping point as the 240-range trn2 profile, full trn3 range). MATH-500 no_think (temp 0.9) with it, MTP k=3, sparse 0.0625, `serve_85k_trn3.sh`: 97.2% |
+ | `Hy3-FP8_mtp_neuron.safetensors` (sha256 `3f3dd44755ce5855...`) | tencent/Hy3-FP8, 81 layers: the 80 decoder layers + the MTP layer `model.layers.80` | layers 0-79 copied unchanged from `Hy3-FP8_neuron.safetensors` (so the target's decode NEFFs are the same); layer 80 from `calibrate_kv_scales_neuron.py calibrate --mtp`: the same run and samples with MTP k=1 on (`max_tokens=2`, so the draft passes write its cache). The same run reproduced layers 0-79 exactly (max ratio 1.000). Layer 80: K absmax 8.06, V absmax 4.94 |
+ | `Hy3-FP8_neuron.safetensors` (sha256 `3c708f14607b1b0d...`) | tencent/Hy3-FP8 (attention fingerprints of all 80 layers) | `scripts/calibrate_kv_scales_neuron.py` on a trn2.48xlarge: the served W8A8 model, BF16 KV cache, config B, prefill-only run of the 75 samples of `kv_calib/full.json` (`bench_data/kv_calib_full_samples.json.gz`, 72,458 tokens); per-layer absmax of the written cache slots, max over the 64 ranks; DEQUANT scale `absmax / 240` |
+ 
+@@ -21,3 +22,5 @@ Use `Hy3-FP8_mtp_neuron.safetensors` with MTP (`--speculative-config
+ '{"method": "mtp", ...}'`): the MTP draft reads its layer's scales from the
+ same profile and refuses an 80-layer one. Without MTP both files give the
+ same scales.
++
++On trn3 use `Hy3-FP8_mtp_neuron_trn3.safetensors`: trn3 FP8 is OCP `float8_e4m3fn` (max 448), while the trn2 profiles are exported for trn2's 240 range, which on trn3 would leave about half the FP8 range unused.
+diff --git a/contrib/models/hy_v3/scripts/bench_85k_slo.sh b/contrib/models/hy_v3/scripts/bench_85k_slo.sh
+new file mode 100755
+index 0000000..3d2745b
+--- /dev/null
++++ b/contrib/models/hy_v3/scripts/bench_85k_slo.sh
+@@ -0,0 +1,54 @@
++#!/bin/bash
++# 85k SLO benchmark against a running server (serve_85k_trn3.sh): closed loop at concurrency C, every request = the
++# shared 78,336-token prefix of bench_data/prefix + its own suffix (85,000 tokens), OUT_LEN output tokens (ignore_eos),
++# temperature 0.9. One warm-up request first fills the shared prefix for this run's cache_salt.
++# SLO: TTFT P50 < 7 s, TPOT P50 < 20 ms, prefix-cache hit rate > 92% (from the server's /metrics).
++# Prompts beyond the dataset's 80 suffixes reuse a suffix with a unique "[i] " marker after the shared prefix, so the
++# prefix cache still stops at the shared prefix.
++# Usage: bench_85k_slo.sh <result dir> "<concurrencies>" [num_prompts=10*C] [out_len=1024]
++# Env: BASE_URL (http://127.0.0.1:8000), MODEL (tokenizer path, tencent/Hy3-FP8).
++set -uo pipefail
++HERE=$(cd "$(dirname "$0")" && pwd)
++O=$1; CS=$2; NP=${3:-}; OUT_LEN=${4:-1024}
++BASE_URL=${BASE_URL:-http://127.0.0.1:8000}; MODEL=${MODEL:-tencent/Hy3-FP8}
++PD=$HERE/../bench_data/prefix
++mkdir -p "$O"; TMP=$(mktemp -d); trap 'rm -rf $TMP' EXIT
++counter() { curl -s "$BASE_URL/metrics" | awk -v n="$1" '$1 ~ "^"n"(_total)?([{]|$)" {s += $NF} END {printf "%d", s}'; }
++for C in $CS; do
++  N=${NP:-$((C * 10))}
++  python3 - "$PD/in85000_p78336_c8.jsonl.gz" "$TMP/p.jsonl" "$N" <<'PY'
++import gzip, json, sys
++rows = [json.loads(l) for l in gzip.open(sys.argv[1], "rt")]
++n = int(sys.argv[3])
++with open(sys.argv[2], "w") as f:
++    for i in range(n):
++        r = rows[1 + i % (len(rows) - 1)]
++        tag = "" if i < len(rows) - 1 else f"[{i}] "
++        f.write(json.dumps({"prompt": rows[0]["prefix"] + tag + r["suffix"]}, ensure_ascii=False) + "\n")
++PY
++  salt="slo-c$C-$(date +%s)"
++  common=(--backend openai-chat --base-url "$BASE_URL" --endpoint /v1/chat/completions --model "$MODEL"
++          --served-model-name hy3 --tokenizer "$MODEL" --trust-remote-code --dataset-name custom
++          --skip-chat-template --ignore-eos --extra-body "{\"cache_salt\": \"$salt\"}")
++  head -1 "$TMP/p.jsonl" > "$TMP/w.jsonl"
++  vllm bench serve "${common[@]}" --dataset-path "$TMP/w.jsonl" --custom-output-len 1 --num-prompts 1 > "$O/c$C.warm.log" 2>&1
++  q0=$(counter vllm:prefix_cache_queries); h0=$(counter vllm:prefix_cache_hits)
++  s0=$(counter vllm:spec_decode_num_drafts); a0=$(counter vllm:spec_decode_num_accepted_tokens)
++  vllm bench serve "${common[@]}" --dataset-path "$TMP/p.jsonl" --temperature 0.9 --request-rate inf \
++    --custom-output-len "$OUT_LEN" --num-prompts "$N" --max-concurrency "$C" --num-warmups 0 \
++    --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
++    --save-result --save-detailed --result-dir "$O" --result-filename "c$C.json" > "$O/c$C.log" 2>&1
++  q1=$(counter vllm:prefix_cache_queries); h1=$(counter vllm:prefix_cache_hits)
++  s1=$(counter vllm:spec_decode_num_drafts); a1=$(counter vllm:spec_decode_num_accepted_tokens)
++  python3 - "$O/c$C.json" "$C" $((q1 - q0)) $((h1 - h0)) $((s1 - s0)) $((a1 - a0)) <<'PY' | tee -a "$O/summary.txt"
++import json, sys
++p, C, q, h, s, a = sys.argv[1], *map(int, sys.argv[2:])
++r = json.load(open(p)); r.update(prefix_cache_hit_rate=h / q if q else 0, spec_steps=s, spec_accepted=a)
++json.dump(r, open(p, "w"))
++ok = r["median_ttft_ms"] < 7000 and r["median_tpot_ms"] < 20 and r["prefix_cache_hit_rate"] > 0.92
++mtp = f" MTP {1 + a / s:.2f} tok/step" if s else ""
++print(f"c={C} {r['completed']}/{r['num_prompts']} TTFT p50/p90 {r['median_ttft_ms']/1e3:.2f}/{r['p90_ttft_ms']/1e3:.2f} s "
++      f"TPOT p50/p90 {r['median_tpot_ms']:.2f}/{r['p90_tpot_ms']:.2f} ms ITL p50 {r['median_itl_ms']:.1f} "
++      f"hit {r['prefix_cache_hit_rate']:.1%} out {r['output_throughput']:.0f} tok/s{mtp}  SLO {'PASS' if ok else 'fail'}")
++PY
++done
+diff --git a/contrib/models/hy_v3/scripts/profile_85k_client.py b/contrib/models/hy_v3/scripts/profile_85k_client.py
+index 16c0bda..78f03e6 100644
+--- a/contrib/models/hy_v3/scripts/profile_85k_client.py
++++ b/contrib/models/hy_v3/scripts/profile_85k_client.py
+@@ -6,6 +6,10 @@ profile on every profiled rank):
+   c1_cold     one request with a new cache_salt: the whole 85k prompt
+               prefills (4096-token chunks), then a few decode steps.
+   c1_decode   one request whose 78k prefix is cached, profiled while it decodes.
++  c1_warm     one request whose 78k prefix is cached, 1 output token: the suffix
++              prefill (~6.7k tokens) that stalls running decodes in mixed serving.
++  c1_tail     a fully cached prompt re-sent: only its last <=64 tokens prefill (the 128-bucket
++              graph of the gang's parked tails), 1 output token.
+   cN_decode   N such requests at once (--batch, default 6: the most that fit
+               next to the profiler's buffers), profiled once all N decode.
+ 
+@@ -101,6 +105,22 @@ def main():
+     [w] = run_requests(client, ps[-1:], salt, 1)
+     w.join()
+ 
++    if "c1_warm" in sessions:
++        def warm():
++            [r] = run_requests(client, ps[10:11], salt, 1)
++            r.join()
++        profiled(base, "c1_warm", warm)
++
++    if "c1_tail" in sessions:
++        # the same prompt twice: the second only prefills its last (<= HY3_PREFIX_ALIGN) tokens, i.e. the
++        # 128-bucket graph the prefill gang's parked tails run (alone in the trace, so the buffer holds it)
++        [f] = run_requests(client, ps[11:12], salt, 1)
++        f.join()
++        def tail():
++            [r] = run_requests(client, ps[11:12], salt, 1)
++            r.join()
++        profiled(base, "c1_tail", tail)
++
+     if "c1_decode" in sessions:
+         def c1():
+             [r] = run_requests(client, ps[:1], salt, 900)
+diff --git a/contrib/models/hy_v3/scripts/reexport_kv_profile.py b/contrib/models/hy_v3/scripts/reexport_kv_profile.py
+new file mode 100644
+index 0000000..a333d3f
+--- /dev/null
++++ b/contrib/models/hy_v3/scripts/reexport_kv_profile.py
+@@ -0,0 +1,28 @@
++"""Re-export a Hy3 KV scale profile for another FP8 range from its stored per-layer absmax.
++
++Usage: python reexport_kv_profile.py <src.safetensors> <dst.safetensors> <target_fp8_max>
++The DEQUANT scales become absmax / target_fp8_max (same clipping point, full range).
++"""
++import json, os, sys
++from safetensors import safe_open
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
++import kv_scales as K
++
++src, dst, tmax = sys.argv[1], sys.argv[2], float(sys.argv[3])
++with safe_open(src, "pt") as f:
++    meta = dict(f.metadata())
++    n = int(meta["num_layers"])
++    old_k = [float(f.get_tensor(K.scale_key(i, "k_scale"))) for i in range(n)]
++    old_v = [float(f.get_tensor(K.scale_key(i, "v_scale"))) for i in range(n)]
++ka, va, omax = json.loads(meta["k_absmax"]), json.loads(meta["v_absmax"]), float(meta["target_fp8_max"])
++assert len(ka) == len(va) == n
++# the stored absmax must reproduce the source scales
++err = max(max(abs(a / omax - d) / d for a, d in zip(ka, old_k)), max(abs(a / omax - d) / d for a, d in zip(va, old_v)))
++print(f"{n} layers; source target {omax}; max rel diff absmax/{omax} vs stored scales {err:.2e}")
++assert err < 1e-5, "absmax metadata does not reproduce the stored scales"
++meta.update(target_fp8_max=str(tmax),
++            reexported_from=json.dumps({"file": src.split("/")[-1], "sha256": K.file_sha256(src), "target_fp8_max": omax}))
++for k in ("format", "direction", "num_layers"):
++    meta.pop(k, None)
++sha = K.save_profile(dst, [a / tmax for a in ka], [a / tmax for a in va], meta)
++print("wrote", dst, "sha256", sha)
+diff --git a/contrib/models/hy_v3/scripts/serve.sh b/contrib/models/hy_v3/scripts/serve.sh
+index b302007..3120cd5 100755
+--- a/contrib/models/hy_v3/scripts/serve.sh
++++ b/contrib/models/hy_v3/scripts/serve.sh
+@@ -21,6 +21,7 @@
+ #                    the packed K layout ("fp8_packed_kv"; FP8_PACKED=0 turns it off)
+ #   NUM_BLOCKS       --num-gpu-blocks-override (e.g. the same KV token count for BF16/FP8)
+ #   EXTRA_ARGS       appended to the vllm serve command line (e.g. --no-async-scheduling)
++#   EXTRA_ADDITIONAL extra top-level --additional-config entries, e.g. '"neuron_profiler": {...}'
+ #
+ # Configs used in the README:
+ #   (max_model_len is always an implicit decode context bucket)
+@@ -39,7 +40,10 @@ PACKED_NC=""
+ if [ "$KV_DTYPE" != auto ] && [ "${FP8_PACKED:-1}" = 1 ]; then
+     PACKED_NC='"fp8_packed_kv": true,'
+ fi
+-export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
++# KV budget cap: skipped when NUM_BLOCKS pins the pool (serve_85k_trn3.sh) unless KV_CAP is given.
++if [ -z "${NUM_BLOCKS:-}" ] || [ -n "${KV_CAP:-}" ]; then
++    export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
++fi
+ TP=${TP:-64}
+ [ "$TP" != 64 ] && EP=${EP:-$TP}
+ [ -n "${CORES:-}" ] && export NEURON_VISIBLE_DEVICES=$CORES
+@@ -64,9 +68,9 @@ exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
+     ${NUM_BLOCKS:+--num-gpu-blocks-override "$NUM_BLOCKS"} \
+     --port "${PORT:-8000}" \
+     ${EXTRA_ARGS:-} \
+-    --additional-config "{\"neuron_config\": {${EP:+\"ep_degree\": $EP,} $PACKED_NC
++    --additional-config "{\"neuron_config\": {${EP:+\"ep_degree\": $EP,} $PACKED_NC ${NC_EXTRA:+$NC_EXTRA,}
+         \"num_batched_tokens_buckets\": $PREFILL_BUCKETS,
+         \"kv_segment_size_buckets\": ${KV_SEGMENTS:-[2048]},
+         \"num_seqs_buckets\": $3${4:+,
+         \"decode_context_length_buckets\": $4}
+-    }}"
++    }${EXTRA_ADDITIONAL:+, $EXTRA_ADDITIONAL}}"
+diff --git a/contrib/models/hy_v3/scripts/serve_85k_trn3.sh b/contrib/models/hy_v3/scripts/serve_85k_trn3.sh
+new file mode 100755
+index 0000000..caaa9ef
+--- /dev/null
++++ b/contrib/models/hy_v3/scripts/serve_85k_trn3.sh
+@@ -0,0 +1,41 @@
++#!/bin/bash
++# One trn3 node (TP=64, EP=64), 85k shared-prefix workload under the SLO TTFT P50 < 7 s, TPOT P50 < 20 ms,
++# prefix-cache hit > 92% (bench_85k_slo.sh): prefill and decode on the same server, FP8 KV, MTP k=3,
++# sparse prefill / decode attention 0.0625, max_model_len 87040, up to 24 running requests.
++# Measured (docs/TRN3_85K_SLO.md): C = 20 ~790 output tok/s with every SLO met; C = 24 ~880 tok/s, TPOT P50 at 19.5-20.5 ms.
++#
++# Env: MODEL, PORT as for serve.sh; GANG_WAIT (default 4.5 s; 5.5 trades TTFT for TPOT at C = 24); NUM_BLOCKS (default 16000).
++# Every HY3_* flag below is documented where model.py / scheduler.py reads it; the rest of the HY3_* flags in model.py
++# are experiments that are off by default.
++set -euo pipefail
++HERE=$(cd "$(dirname "$0")" && pwd)
++
++export KV_DTYPE=fp8 MTP_K=3
++export HY3_KV_SCALE_PROFILE=${HY3_KV_SCALE_PROFILE:-kv_profiles/Hy3-FP8_mtp_neuron_trn3.safetensors}  # 448-range (OCP FP8) scales
++export VLLM_NEURON_LIBTORCH_NEURONX_LITE=1 VLLM_NEURON_BACKEND=neuron_native
++export VLLM_NEURON_RESERVED_HEADROOM_GIB=${VLLM_NEURON_RESERVED_HEADROOM_GIB:-8}
++# Admission: the worst-case cap (no prefix sharing) would admit 5 requests at max_model_len 87040; the shared prefix
++# is stored once, so 24 fit in the pinned pool.
++export VLLM_NEURON_MAX_KV_CONCURRENT=${VLLM_NEURON_MAX_KV_CONCURRENT:-24}
++
++# Prefill: STATIC_MX routed experts (trn3 FP8 MX matmul), no in-kernel reduce, weight-reload skip, top-k all-gather,
++# padded routing rows / mapping on the NKI path, coarse 64-token blocks for segmented attention, block-granular K/V
++# cache writes, RoPE table, sparse prefill prep.
++export HY3_MOE_CTE_MX=1 HY3_MOE_CTE_NO_REDUCE=1 HY3_MOE_CTE_SKIP_WEIGHT=1 HY3_MX_DMA_SPLIT=2 HY3_PREFILL_AG_TOPK=1 \
++    HY3_MOE_ROWPAD=1 HY3_MOE_PIPE=1 HY3_PREFILL_MOE_SPLIT=1 HY3_PREFILL_FUSED_QKV=0 \
++    HY3_PREFILL_ATTN_BLOCK=64 HY3_PREFIX_ALIGN=64 HY3_PREFILL_ROW_SCATTER=1 HY3_PREFILL_BLOCK_SCATTER=1 \
++    HY3_ROPE_TABLE=1 HY3_KSUM_PREFILL_PREP=1 HY3_SPARSE_PREFILL_PREP=1
++# Decode: fused MoE (MX), KV data parallelism (forked attention_block_tkg, 8 ranks per KV head) with sparse selection
++# inside it, kernel-returned K + fused K-summary update, selection every 16 layers, flat-gather selection, constant
++# per-step tensors, pooled output / H2D buffers.
++export HY3_DECODE_MOE_FUSED=1 HY3_DECODE_MOE_MX=1 HY3_DECODE_HITS=0 \
++    HY3_DECODE_KVDP_FORK=8 HY3_DECODE_KVDP_MIN_B=2 HY3_SPARSE_KVDP=1 \
++    HY3_SPARSE_PREFILL=0.0625 HY3_SPARSE_DECODE=0.0625 HY3_SPARSE_MIN_BATCH=4 HY3_SPARSE_SELECT_EVERY=16 \
++    HY3_SPARSE_KFROM_KERNEL=1 HY3_SPARSE_KSUM_KERNEL=1 HY3_SPARSE_KSUM_SELECT_ONLY=1 HY3_SPARSE_FLAT_GATHER=1 \
++    HY3_DECODE_STEP_CONST=1 HY3_IO_STABLE=2 HY3_IO_STABLE_MAXB=0 HY3_IO_STABLE_H2D=3
++# Scheduler: gang prefill (hold the next prefills until a gang forms, release together) so decodes stall fewer times.
++export HY3_PREFILL_GANG=1 HY3_GANG_MAX_WAIT_S=${GANG_WAIT:-4.5} HY3_GANG_TAIL=64 HY3_GANG_GATHER_S=0.25 HY3_GANG_NO_TAIL=1
++
++export NUM_BLOCKS=${NUM_BLOCKS:-16000} KV_SEGMENTS='[8192]'
++export PREFILL_BUCKETS='[128, 512, 1024, 2048, 4096, 7168, 8192]'
++exec "$HERE/serve.sh" 87040 24 '[1, 8, 16, 20, 24]' '[32768]'
+diff --git a/contrib/models/hy_v3/scripts/serve_latency.sh b/contrib/models/hy_v3/scripts/serve_latency.sh
+index b789a87..c91edfc 100755
+--- a/contrib/models/hy_v3/scripts/serve_latency.sh
++++ b/contrib/models/hy_v3/scripts/serve_latency.sh
+@@ -9,7 +9,7 @@
+ #      KV_DTYPE=fp8 (FP8 KV with packed K; KV scales from HY3_KV_SCALE_PROFILE).
+ set -euo pipefail
+ export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
+-export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
++# export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}  # rejected by the 0.29.0.1.2.0 runtime
+ SPEC_ARGS=()
+ if [ -n "${MTP_K:-}" ]; then
+     SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP_K}")
+-- 
+2.53.0
+

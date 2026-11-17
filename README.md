@@ -21,6 +21,12 @@ results are compared against the AWS published Trainium3 specs.
 Supporting files: `run_micro.sh` (suite runner), `common.py` (process setup and timing),
 `aggregate.py` (markdown tables).
 
+## Model serving
+
+[`hy3_vllm_neuron/`](hy3_vllm_neuron/): a vllm-neuron patch series that serves Hy3-FP8 on one trn3 node under a
+TTFT / TPOT SLO (85k shared-prefix prompts, about 800 output tok/s at C = 20). It includes the results and the steps
+to reproduce them.
+
 ## Quick start
 
 Requirements: a Trainium3 instance with the Neuron driver/runtime, a Python environment with
