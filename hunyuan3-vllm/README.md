@@ -34,7 +34,7 @@ that were measured and left off.
 ```bash
 git clone https://github.com/qingzwang/vllm-neuron.git && cd vllm-neuron
 git checkout -b hy3-trn3-85k-slo e891054
-git am /path/to/trn3-bench/hy3_vllm_neuron/patches/*.patch
+git am /path/to/trn3-bench/hunyuan3-vllm/patches/*.patch
 
 cd contrib/models/hy_v3 && pip install --no-deps -e .
 export PYTHONPATH=$PWD/../../..          # use this checkout's vllm_neuron runtime
@@ -42,7 +42,7 @@ MODEL=/local/nvme/Hy3-FP8 bash scripts/serve_85k_trn3.sh          # fresh compil
 bash scripts/bench_85k_slo.sh results/trn3_85k "20 24"             # in another shell
 ```
 
-Keep the model, the compile caches and `HOME`/`TMPDIR` on local NVMe, as for the micro-benchmarks.
+Keep the model, the compile caches and `HOME`/`TMPDIR` on local NVMe, as for the [micro-benchmarks](../microbenchmarks/).
 `GANG_WAIT=5.5` trades TTFT for TPOT at C = 24.
 
 ## Results
