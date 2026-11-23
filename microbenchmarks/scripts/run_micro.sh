@@ -5,7 +5,7 @@
 #   bash run_micro.sh                          # everything, at 1 / 4 (one chip) / 64 ranks
 #   ONLY="engine gemm" NPS="1 4" bash run_micro.sh
 #
-# ONLY  subset of: engine gemm mxfp8 stream dma hbm h2d coll   (mxfp8 and engine/mxfp8 need trn3+)
+# ONLY  subset of: engine gemm mxfp8 stream dma hbm h2d coll   (mxfp8, incl. MXFP4 GEMM, and engine/mx need trn3+)
 # NPS   rank counts for the per-core sweeps (default "1 4 64"; set to your cores-per-chip / total)
 # VENV  torch-neuronx venv to activate (default: newest /opt/aws_neuronx_venv_torch_neuronx*)
 # R     results dir (default: <repo>/results/<instance-type>)
@@ -39,6 +39,7 @@ if want gemm; then
 fi
 if want mxfp8; then
   for np in $NPS; do run gemm_mxfp8_np$np $np 06_mxfp8_gemm.py --mode prequant; done
+  for np in $NPS; do run gemm_mxfp4_np$np $np 06_mxfp8_gemm.py --mode fp4; done
   run gemm_mxfp8_bf16in_np1 1 06_mxfp8_gemm.py --mode bf16
 fi
 if want stream; then

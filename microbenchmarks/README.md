@@ -1,6 +1,6 @@
 # Trainium3 micro-benchmark suite
 
-Single-node benchmarks for AWS Trainium3: compute (bf16 / fp32 / MXFP8 GEMM and the Tensor Engine
+Single-node benchmarks for AWS Trainium3: compute (bf16 / fp32 / MXFP8 / MXFP4 GEMM and the Tensor Engine
 ceiling), HBM bandwidth (framework copy, STREAM, NKI DMA modes), host↔device transfers, and
 NeuronLink collectives. Each runs at 1 logical core, one chip, and the full instance, and the
 results are compared against the AWS published Trainium3 specs.
@@ -9,9 +9,9 @@ results are compared against the AWS published Trainium3 specs.
 
 | script | measures | how |
 |---|---|---|
-| `08_engine_peak.py` | Tensor Engine ceiling, bf16 and MXFP8 | NKI back-to-back `nc_matmul` / `nc_matmul_mx` on on-chip (SBUF) operands; result checked against `A^T B` |
+| `08_engine_peak.py` | Tensor Engine ceiling, bf16, MXFP8 and MXFP4 | NKI back-to-back `nc_matmul` / `nc_matmul_mx` on on-chip (SBUF) operands; result checked against `A^T B` |
 | `01_gemm.py` | bf16 / fp32 GEMM | `torch.compile`d chain of square matmuls `y = y @ w` in one graph; checked vs CPU fp32 for N ≤ 2048 |
-| `06_mxfp8_gemm.py` | MXFP8 GEMM | nki-library `matmul_mxfp8`; `--mode prequant` (operands already MXFP8) or `--mode bf16` (quantized in-kernel); accuracy checked with nki-library's golden quantizer |
+| `06_mxfp8_gemm.py` | MXFP8 GEMM | nki-library `matmul_mxfp8`; `--mode prequant` (operands already MXFP8) or `--mode bf16` (quantized in-kernel); accuracy checked with nki-library's golden quantizer. `--mode fp4`: MXFP4 (e2m1) operands through the same kernel, checked against the exact product |
 | `07_dma_nki.py` | DMA bandwidth per descriptor mode | NKI `dma_copy` HBM→HBM, HBM→SBUF, SBUF→HBM × `dge_mode` none / hwdge / swdge |
 | `05_hbm_copy.py` | HBM bandwidth through the framework | device `copy_` (read + write), chunked |
 | `02_stream.py` | STREAM copy / scale / add / triad | one torch op per kernel into a preallocated output, so counted bytes = moved bytes |
@@ -100,7 +100,11 @@ Every measurement produces one record per rank and one aggregate record (`"rank"
 - **FLOP counting.** 2 per multiply-add. An `nc_matmul_mx` contracts over the partitions *and*
   the 4 values packed in each x4 element: stationary `[128, M]`, moving `[128, N]` →
   `2·M·N·512` FLOPs.
-- **Correctness.** GEMM (N ≤ 2048), MXFP8 GEMM, and engine-peak results are checked against
+- **MXFP4 operands.** `nisa.quantize_mx` only emits FP8, so FP4 operands are random e2m1 codes
+  packed on the host (4 nibbles per 16-bit `float4_e2m1fn_x4` element) with unit scales and viewed
+  as FP4 inside the kernel. Products of e2m1 values are exact in fp32, so the check is tight (relL2 is
+  just the bf16 output rounding).
+- **Correctness.** GEMM (N ≤ 2048), MXFP8/MXFP4 GEMM, and engine-peak results are checked against
   references and the script exits on failure; relL2 is recorded.
 
 ## Results (trn3-dev1.48xlarge, 16 chips, LNC=2, 64 logical cores)
@@ -116,6 +120,8 @@ HBM/DMA, 2.56 TB/s NeuronLink) × 16.
 | GEMM fp32 (N = 2048) | 38.8 TF | 155 TF | 2.48 PF | 85 % |
 | Tensor Engine ceiling, MXFP8 | 540–574 TF | 1.69 PF | 25.0 PF | 62 % at full load (see below) |
 | GEMM MXFP8, pre-quantized (N = 8192) | 491 TF | 1.91 PF | 29.6 PF | 74 % |
+| Tensor Engine ceiling, MXFP4 ¹ | 622 TF | 2.02 PF | 32.9 PF | 82 % at full load |
+| GEMM MXFP4, pre-quantized (N = 8192) ¹ | 603 TF | 2.37 PF | 37.0 PF | 92 % |
 | DMA load HBM→SBUF (hwdge) | 1.12 TB/s | 4.48 TB/s | 71.0 TB/s | 91 % |
 | DMA store SBUF→HBM (hwdge) | 1.20 TB/s | 4.80 TB/s | 77.6 TB/s | 99 % |
 | DMA HBM→HBM (hwdge, read + write) | 1.00 TB/s | 3.99 TB/s | 63.5 TB/s | 81 % |
@@ -123,6 +129,11 @@ HBM/DMA, 2.56 TB/s NeuronLink) × 16.
 | H2D / D2H, 1 GiB | 13.8 / 14.3 GB/s | 14 / 14 GB/s | 113 / 114 GB/s | — |
 | all-reduce, 64 ranks | — | — | 7.2 µs (32 B), 446 GB/s busbw | — |
 | all-to-all, 64 ranks | — | — | 16.6 µs (32 B), 33 GB/s busbw | — |
+
+¹ MXFP4 rows measured 2026-11-23 (same toolchain, torch-neuronx 2.14.3 / Python 3.14). The MXFP4 %
+uses the MXFP8 figure (2,517 TF per chip), since no separate MXFP4 figure is used here. The same
+run re-measured MXFP8: GEMM 490 TF / 1.93 PF / 29.5 PF (N = 8192), engine ceiling 533 TF on one
+core and ~400 TF per core at full load.
 
 Observations:
 
@@ -140,6 +151,10 @@ Observations:
   NUMA binding make no difference.
 - **All-to-all collapses beyond one chip** (294 GB/s busbw at 4 ranks → 33 GB/s at 64), while
   the other collectives hold ~440 GB/s at 64 ranks.
+- **MXFP4 is ~20–25 % faster than MXFP8 on the same Tensor Engine** (ceiling 622 vs 533 TF on
+  one core; GEMM 603 vs 490 TF), and the nki-library GEMM reaches 97 % of the FP4 ceiling on one
+  core. It shows the same full-load drop (622 → ~510 TF per core in the gap-free ceiling), while
+  the GEMM holds ~590 TF per core at 64 ranks, so the instance reaches 92 % of the MX figure.
 - **Small MXFP8 GEMMs are launch-bound:** N = 2048 runs one ~100 µs kernel per call (~170–220 TF).
 
 ## Pitfalls
